@@ -1,8 +1,10 @@
-# FPGA Museum Guide
+## 项目简介
 
-基于安路 EG4S20 FPGA 的文博多媒体展示工程，面向 HX4S20C 开发板。目标仓库：`vaseliu/FPGA-Museum-Guide`。当前整理基线为 v7.9.3。
+FPGA Museum Guide 是“数芯天下”团队基于安路 EG4S20 FPGA 开发的文博多媒体展示系统。系统采用纯硬件架构，从 TF 卡读取 640×480 BMP 图片和 WAV 音频，图像经 SDRAM 双缓冲后通过 HDMI 显示。系统支持自动轮播、按键与手势交互、中文滚动字幕，并通过 FFT 将正在播放的音频实时显示为频谱。
 
-**当前是本地发布草稿，尚未发布，也尚未授予统一开源许可证。** 厂商加密源文件及生成 IP 已暂时排除，因此本草稿不具备独立完成整机综合的全部依赖。发布前须完成 [来源和授权核对](THIRD_PARTY_NOTICES.md)。
+图像处理模块支持亮度与色彩增强、轮廓强化、暖色海报效果、双线性缩放、透明度调节及渐变切换。展品图片和音频可通过 TF 卡更新，适用于文物介绍、参观路线展示与展厅信息提示。
+
+当前版本为 **v7.9.3**。完整构建需要另行准备匹配的厂商 IP，依赖清单见 [EXCLUDED_VENDOR_FILES.txt](EXCLUDED_VENDOR_FILES.txt)，第三方代码来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 功能
 
