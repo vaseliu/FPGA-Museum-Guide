@@ -1,0 +1,228 @@
+`timescale 1ns/1ps
+//=============================================================================
+// my_display_fx.v  v3.0
+// Four modes: original, grayscale, negative and RGB channel rotation.
+// Each committed picture selects the next mode and starts a fade at the next
+// frame boundary. A colored marker identifies the active mode.
+//=============================================================================
+module my_display_fx #(
+    parameter H_ACTIVE       = 640,
+    parameter V_ACTIVE       = 480,
+    parameter BORDER_W       = 8,
+    parameter BORDER_H       = 8,
+    parameter FADE_PER_FRAME = 8'd8
+)(
+    input  wire        video_clk,
+    input  wire        rst,
+    input  wire        hs,
+    input  wire        vs,
+    input  wire        de,
+    input  wire [1:0]  disp_buf_idx,
+    input  wire [23:0] rgb_in,
+    output reg         hs_o,
+    output reg         vs_o,
+    output reg         de_o,
+    output reg  [23:0] rgb_o
+);
+
+    // Active-area coordinates. x and y are one-based while de is asserted.
+    reg [10:0] x;
+    reg [10:0] y;
+    reg        de_d;
+    reg        vs_d;
+    wire       de_rise = de & ~de_d;
+    wire       vs_rise = vs & ~vs_d;
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            de_d <= 1'b0;
+            vs_d <= 1'b0;
+        end else begin
+            de_d <= de;
+            vs_d <= vs;
+        end
+    end
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst)
+            x <= 11'd0;
+        else if (de)
+            x <= x + 11'd1;
+        else
+            x <= 11'd0;
+    end
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst || vs_rise)
+            y <= 11'd0;
+        else if (de_rise)
+            y <= y + 11'd1;
+    end
+
+    // Synchronize the display-buffer index into the video clock domain.
+    reg [1:0] buf_s1;
+    reg [1:0] buf_s2;
+    reg [1:0] buf_s2_d;
+    wire      buf_sw = (buf_s2 != buf_s2_d);
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            buf_s1   <= 2'd0;
+            buf_s2   <= 2'd0;
+            buf_s2_d <= 2'd0;
+        end else begin
+            buf_s1   <= disp_buf_idx;
+            buf_s2   <= buf_s1;
+            buf_s2_d <= buf_s2;
+        end
+    end
+
+    // Change mode and brightness only at a frame boundary to avoid tearing.
+    reg [1:0] effect_mode;
+    reg       switch_pending;
+    reg       fading;
+    reg [7:0] fade;
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            effect_mode    <= 2'd0;
+            switch_pending <= 1'b0;
+            fading         <= 1'b0;
+            fade           <= 8'd255;
+        end else begin
+            if (buf_sw)
+                switch_pending <= 1'b1;
+
+            if (vs_rise && (switch_pending || buf_sw)) begin
+                switch_pending <= 1'b0;
+                effect_mode    <= effect_mode + 2'd1;
+                fading         <= 1'b1;
+                fade           <= 8'd0;
+            end else if (fading && vs_rise) begin
+                if (fade >= (8'd255 - FADE_PER_FRAME)) begin
+                    fade   <= 8'd255;
+                    fading <= 1'b0;
+                end else begin
+                    fade <= fade + FADE_PER_FRAME;
+                end
+            end
+        end
+    end
+
+    // Pipeline stage 1: capture input pixel and region flags.
+    reg        hs_p1;
+    reg        vs_p1;
+    reg        de_p1;
+    reg [23:0] rgb_p1;
+    reg        border_p1;
+    reg        marker_p1;
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            hs_p1     <= 1'b0;
+            vs_p1     <= 1'b0;
+            de_p1     <= 1'b0;
+            rgb_p1    <= 24'd0;
+            border_p1 <= 1'b0;
+            marker_p1 <= 1'b0;
+        end else begin
+            hs_p1  <= hs;
+            vs_p1  <= vs;
+            de_p1  <= de;
+            rgb_p1 <= de ? rgb_in : 24'd0;
+            border_p1 <= de && ((x <= BORDER_W) ||
+                                (x > (H_ACTIVE - BORDER_W)) ||
+                                (y <= BORDER_H) ||
+                                (y > (V_ACTIVE - BORDER_H)));
+            marker_p1 <= de && (x > BORDER_W + 4) &&
+                         (x <= BORDER_W + 68) &&
+                         (y > BORDER_H + 4) &&
+                         (y <= BORDER_H + 16);
+        end
+    end
+
+    // Grayscale approximation: (5R + 9G + 2B) / 16.
+    wire [7:0] r_p1 = rgb_p1[23:16];
+    wire [7:0] g_p1 = rgb_p1[15:8];
+    wire [7:0] b_p1 = rgb_p1[7:0];
+    wire [11:0] gray_sum = {4'd0, r_p1} + ({4'd0, r_p1} << 2) +
+                           {4'd0, g_p1} + ({4'd0, g_p1} << 3) +
+                           ({4'd0, b_p1} << 1);
+    wire [7:0] gray = gray_sum[11:4];
+
+    reg [23:0] effect_rgb;
+    reg [23:0] marker_rgb;
+    always @(*) begin
+        case (effect_mode)
+            2'd0: begin
+                effect_rgb = rgb_p1;
+                marker_rgb = 24'hFFFFFF;
+            end
+            2'd1: begin
+                effect_rgb = {gray, gray, gray};
+                marker_rgb = 24'hA0A0A0;
+            end
+            2'd2: begin
+                effect_rgb = ~rgb_p1;
+                marker_rgb = 24'hFF40FF;
+            end
+            default: begin
+                effect_rgb = {g_p1, b_p1, r_p1};
+                marker_rgb = 24'h40FFFF;
+            end
+        endcase
+    end
+
+    // Pipeline stage 2: select effect, marker and border.
+    reg        hs_p2;
+    reg        vs_p2;
+    reg        de_p2;
+    reg [23:0] proc_rgb_p2;
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            hs_p2       <= 1'b0;
+            vs_p2       <= 1'b0;
+            de_p2       <= 1'b0;
+            proc_rgb_p2 <= 24'd0;
+        end else begin
+            hs_p2 <= hs_p1;
+            vs_p2 <= vs_p1;
+            de_p2 <= de_p1;
+            if (!de_p1)
+                proc_rgb_p2 <= 24'd0;
+            else if (border_p1)
+                proc_rgb_p2 <= ~effect_rgb;
+            else if (marker_p1)
+                proc_rgb_p2 <= marker_rgb;
+            else
+                proc_rgb_p2 <= effect_rgb;
+        end
+    end
+
+    // Pipeline stage 3: apply fade independently to R, G and B.
+    wire [15:0] fade_r = proc_rgb_p2[23:16] * fade;
+    wire [15:0] fade_g = proc_rgb_p2[15:8]  * fade;
+    wire [15:0] fade_b = proc_rgb_p2[7:0]   * fade;
+    wire [23:0] faded_rgb = {fade_r[15:8], fade_g[15:8], fade_b[15:8]};
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            hs_o  <= 1'b0;
+            vs_o  <= 1'b0;
+            de_o  <= 1'b0;
+            rgb_o <= 24'd0;
+        end else begin
+            hs_o <= hs_p2;
+            vs_o <= vs_p2;
+            de_o <= de_p2;
+            if (!de_p2)
+                rgb_o <= 24'd0;
+            else if (fading)
+                rgb_o <= faded_rgb;
+            else
+                rgb_o <= proc_rgb_p2;
+        end
+    end
+
+endmodule

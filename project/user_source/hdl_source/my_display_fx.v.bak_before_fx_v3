@@ -1,0 +1,332 @@
+`timescale 1ns/1ps
+//=============================================================================
+// Original real-time image-processing pipeline for the HX4S20 multimedia demo.
+// Modes: 0 passthrough; 1 adaptive enhancement; 2 contour fusion;
+//        3 warm posterization.  key3 selects the mode at a frame boundary.
+//=============================================================================
+module my_display_fx #(
+    parameter H_ACTIVE       = 640,
+    parameter V_ACTIVE       = 480,
+    parameter FADE_PER_FRAME = 8'd16
+)(
+    input  wire        video_clk,
+    input  wire        rst,
+    input  wire        hs,
+    input  wire        vs,
+    input  wire        de,
+    input  wire [1:0]  disp_buf_idx,
+    input  wire        effect_next,
+    input  wire [23:0] rgb_in,
+    output reg         hs_o,
+    output reg         vs_o,
+    output reg         de_o,
+    output reg  [23:0] rgb_o,
+    output reg  [1:0]  effect_mode,
+    output reg  [7:0]  scene_luma
+);
+
+    function [7:0] abs_diff8;
+        input [7:0] a;
+        input [7:0] b;
+        begin
+            abs_diff8 = (a >= b) ? (a - b) : (b - a);
+        end
+    endfunction
+
+    function [7:0] clamp_s11;
+        input signed [10:0] value;
+        begin
+            if (value < 0)
+                clamp_s11 = 8'd0;
+            else if (value > 11'sd255)
+                clamp_s11 = 8'd255;
+            else
+                clamp_s11 = value[7:0];
+        end
+    endfunction
+
+    function [7:0] poster_level;
+        input [7:0] value;
+        begin
+            case (value[7:5])
+                3'd0: poster_level = 8'd8;
+                3'd1: poster_level = 8'd40;
+                3'd2: poster_level = 8'd72;
+                3'd3: poster_level = 8'd104;
+                3'd4: poster_level = 8'd144;
+                3'd5: poster_level = 8'd184;
+                3'd6: poster_level = 8'd224;
+                default: poster_level = 8'd255;
+            endcase
+        end
+    endfunction
+
+    // Zero-based coordinates while DE is asserted.
+    reg [10:0] x;
+    reg [10:0] y;
+    reg        de_d;
+    reg        vs_d;
+    wire       de_rise = de & ~de_d;
+    wire       frame_edge = vs & ~vs_d;
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            de_d <= 1'b0;
+            vs_d <= 1'b0;
+            x    <= 11'd0;
+            y    <= 11'd0;
+        end else begin
+            de_d <= de;
+            vs_d <= vs;
+            if (frame_edge)
+                y <= 11'd0;
+            else if (de_rise)
+                y <= y + 11'd1;
+            if (de)
+                x <= x + 11'd1;
+            else
+                x <= 11'd0;
+        end
+    end
+
+    // Image/effect changes are committed at frame boundaries and faded in.
+    reg [1:0] buf_s1;
+    reg [1:0] buf_s2;
+    reg [1:0] buf_s2_d;
+    reg       image_change_pending;
+    reg       effect_change_pending;
+    reg       fading;
+    reg [7:0] fade;
+    wire      buffer_changed = (buf_s2 != buf_s2_d);
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            buf_s1                <= 2'd0;
+            buf_s2                <= 2'd0;
+            buf_s2_d              <= 2'd0;
+            image_change_pending  <= 1'b0;
+            effect_change_pending <= 1'b0;
+            effect_mode           <= 2'd0;
+            fading                <= 1'b0;
+            fade                  <= 8'd255;
+        end else begin
+            buf_s1   <= disp_buf_idx;
+            buf_s2   <= buf_s1;
+            buf_s2_d <= buf_s2;
+            if (buffer_changed)
+                image_change_pending <= 1'b1;
+            if (effect_next)
+                effect_change_pending <= 1'b1;
+
+            if (frame_edge) begin
+                if (effect_change_pending || effect_next) begin
+                    effect_mode           <= effect_mode + 2'd1;
+                    effect_change_pending <= 1'b0;
+                    fading                <= 1'b1;
+                    fade                  <= 8'd0;
+                end else if (image_change_pending || buffer_changed) begin
+                    image_change_pending <= 1'b0;
+                    fading               <= 1'b1;
+                    fade                 <= 8'd0;
+                end else if (fading) begin
+                    if (fade >= (8'd255 - FADE_PER_FRAME)) begin
+                        fade   <= 8'd255;
+                        fading <= 1'b0;
+                    end else begin
+                        fade <= fade + FADE_PER_FRAME;
+                    end
+                end
+            end
+        end
+    end
+
+    // Sparse frame measurement: 40 x 30 samples.  The shift gives a stable,
+    // intentionally highlight-biased estimate without a divider.
+    reg [19:0] sample_sum;
+    wire [7:0] r_now = rgb_in[23:16];
+    wire [7:0] g_now = rgb_in[15:8];
+    wire [7:0] b_now = rgb_in[7:0];
+    wire [9:0] luma_sum_now = {2'd0, r_now} +
+                               ({2'd0, g_now} << 1) + {2'd0, b_now};
+    wire [7:0] luma_now = luma_sum_now[9:2];
+    wire       sample_pixel = de && (x[3:0] == 4'd0) &&
+                               (y[3:0] == 4'd0);
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            sample_sum <= 20'd0;
+            scene_luma <= 8'd128;
+        end else if (frame_edge) begin
+            if (sample_sum > 20'd261120)
+                scene_luma <= 8'd255;
+            else
+                scene_luma <= sample_sum[17:10];
+            sample_sum <= 20'd0;
+        end else if (sample_pixel) begin
+            sample_sum <= sample_sum + {12'd0, luma_now};
+        end
+    end
+
+    // One previous-line buffer produces a two-axis edge measure.
+    reg [7:0] line_luma [0:H_ACTIVE-1];
+    reg [7:0] left_luma;
+    reg [8:0] edge_sum_p1;
+    reg [7:0] luma_p1;
+    reg [23:0] rgb_p1;
+    reg        hs_p1;
+    reg        vs_p1;
+    reg        de_p1;
+    reg        mode_bar_p1;
+    reg        meter_bg_p1;
+    reg        meter_fill_p1;
+    wire [9:0] line_addr = (x < H_ACTIVE) ? x[9:0] : 10'd0;
+    wire [7:0] edge_h_now = (x == 0) ? 8'd0 : abs_diff8(luma_now, left_luma);
+    wire [7:0] edge_v_now = (y == 0) ? 8'd0 : abs_diff8(luma_now, line_luma[line_addr]);
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            left_luma     <= 8'd0;
+            edge_sum_p1   <= 9'd0;
+            luma_p1       <= 8'd0;
+            rgb_p1        <= 24'd0;
+            hs_p1         <= 1'b0;
+            vs_p1         <= 1'b0;
+            de_p1         <= 1'b0;
+            mode_bar_p1   <= 1'b0;
+            meter_bg_p1   <= 1'b0;
+            meter_fill_p1 <= 1'b0;
+        end else begin
+            hs_p1   <= hs;
+            vs_p1   <= vs;
+            de_p1   <= de;
+            rgb_p1  <= de ? rgb_in : 24'd0;
+            luma_p1 <= luma_now;
+            mode_bar_p1 <= de && (y < 11'd10) && (x < 11'd72);
+            meter_bg_p1 <= de && (y < 11'd10) &&
+                           (x >= 11'd80) && (x < 11'd336);
+            meter_fill_p1 <= de && (y < 11'd10) &&
+                             (x >= 11'd80) &&
+                             (x < ({3'd0, scene_luma} + 11'd80));
+            if (de) begin
+                line_luma[line_addr] <= luma_now;
+                left_luma    <= luma_now;
+                edge_sum_p1  <= {1'b0, edge_h_now} + {1'b0, edge_v_now};
+            end else begin
+                left_luma   <= 8'd0;
+                edge_sum_p1 <= 9'd0;
+            end
+        end
+    end
+
+    // Adaptive contrast, saturation and exposure arithmetic.
+    wire signed [10:0] r_s = $signed({1'b0, rgb_p1[23:16]});
+    wire signed [10:0] g_s = $signed({1'b0, rgb_p1[15:8]});
+    wire signed [10:0] b_s = $signed({1'b0, rgb_p1[7:0]});
+    wire signed [10:0] y_s = $signed({1'b0, luma_p1});
+    wire signed [10:0] contrast_term = (y_s - 11'sd128) >>> 2;
+    reg signed [10:0] exposure_bias;
+
+    always @(*) begin
+        if (scene_luma < 8'd96)
+            exposure_bias = $signed({3'd0, (8'd96 - scene_luma)}) >>> 1;
+        else if (scene_luma > 8'd184)
+            exposure_bias = -($signed({3'd0, (scene_luma - 8'd184)}) >>> 2);
+        else
+            exposure_bias = 11'sd0;
+    end
+
+    wire signed [10:0] enhanced_r_s = r_s + ((r_s - y_s) >>> 2) +
+                                       contrast_term + exposure_bias;
+    wire signed [10:0] enhanced_g_s = g_s + ((g_s - y_s) >>> 2) +
+                                       contrast_term + exposure_bias;
+    wire signed [10:0] enhanced_b_s = b_s + ((b_s - y_s) >>> 2) +
+                                       contrast_term + exposure_bias;
+    wire [23:0] enhanced_rgb = {clamp_s11(enhanced_r_s),
+                                clamp_s11(enhanced_g_s),
+                                clamp_s11(enhanced_b_s)};
+    wire [7:0] poster_r = poster_level(rgb_p1[23:16]);
+    wire [7:0] poster_g = poster_level(rgb_p1[15:8]);
+    wire [7:0] poster_b = poster_level(rgb_p1[7:0]);
+    wire [8:0] poster_r_warm = {1'b0, poster_r} + 9'd16;
+    wire [7:0] poster_r_out = poster_r_warm[8] ? 8'hff : poster_r_warm[7:0];
+    wire [7:0] poster_b_out = (poster_b < 8'd12) ? 8'd0 : (poster_b - 8'd12);
+    wire [23:0] poster_rgb = {poster_r_out, poster_g, poster_b_out};
+
+    reg [23:0] processed_p2;
+    reg        hs_p2;
+    reg        vs_p2;
+    reg        de_p2;
+    reg [23:0] mode_color;
+
+    always @(*) begin
+        case (effect_mode)
+            2'd0: mode_color = 24'hf4f4f4;
+            2'd1: mode_color = 24'h36d66b;
+            2'd2: mode_color = 24'h21d4fd;
+            default: mode_color = 24'hff9f43;
+        endcase
+    end
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            processed_p2 <= 24'd0;
+            hs_p2         <= 1'b0;
+            vs_p2         <= 1'b0;
+            de_p2         <= 1'b0;
+        end else begin
+            hs_p2 <= hs_p1;
+            vs_p2 <= vs_p1;
+            de_p2 <= de_p1;
+            if (!de_p1)
+                processed_p2 <= 24'd0;
+            else if (mode_bar_p1)
+                processed_p2 <= mode_color;
+            else if (meter_fill_p1)
+                processed_p2 <= (scene_luma < 8'd96) ? 24'hffd43b :
+                                (scene_luma > 8'd184) ? 24'hff6b6b : 24'h51cf66;
+            else if (meter_bg_p1)
+                processed_p2 <= 24'h202830;
+            else begin
+                case (effect_mode)
+                    2'd0: processed_p2 <= rgb_p1;
+                    2'd1: processed_p2 <= enhanced_rgb;
+                    2'd2: begin
+                        if (edge_sum_p1 > 9'd96)
+                            processed_p2 <= 24'h35e7ff;
+                        else if (edge_sum_p1 > 9'd44)
+                            processed_p2 <= {luma_p1, luma_p1, 8'hff};
+                        else
+                            processed_p2 <= {3{(luma_p1 >> 1)}};
+                    end
+                    default: processed_p2 <= poster_rgb;
+                endcase
+            end
+        end
+    end
+
+    // Frame-stepped fade prevents abrupt picture/effect changes.
+    wire [15:0] fade_r = processed_p2[23:16] * fade;
+    wire [15:0] fade_g = processed_p2[15:8]  * fade;
+    wire [15:0] fade_b = processed_p2[7:0]   * fade;
+    wire [23:0] faded_rgb = {fade_r[15:8], fade_g[15:8], fade_b[15:8]};
+
+    always @(posedge video_clk or posedge rst) begin
+        if (rst) begin
+            hs_o  <= 1'b0;
+            vs_o  <= 1'b0;
+            de_o  <= 1'b0;
+            rgb_o <= 24'd0;
+        end else begin
+            hs_o <= hs_p2;
+            vs_o <= vs_p2;
+            de_o <= de_p2;
+            if (!de_p2)
+                rgb_o <= 24'd0;
+            else if (fading)
+                rgb_o <= faded_rgb;
+            else
+                rgb_o <= processed_p2;
+        end
+    end
+
+endmodule
